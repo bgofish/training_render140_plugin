@@ -5,7 +5,7 @@
 name        = "training_render"
 version     = "1.4.1"
 description = "Render snapshots/Video from either fixed or moving camera positions during 3DGS training"
-author     = "Brian Davis (bb6)" 
+authors = [{name = "Brian Davis (bb6)"}]
 
 dependencies = ["av"]
 
