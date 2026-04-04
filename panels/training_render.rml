@@ -32,6 +32,21 @@
     <button class="num-step-btn" data-event-mousedown="num_step('max_iters', 1)">+</button>
   </div>
 
+  <!-- Rate Schedule -->
+  <div class="setting-row" title="Choose fixed render rate or a CSV-driven rate schedule.">
+    <span class="prop-label">Render rate mode</span>
+    <select data-value="rate_mode">
+      <option value="fixed">Fixed</option>
+      <option value="schedule">Schedule</option>
+    </select>
+  </div>
+  <span class="path-display text-muted">{{rate_schedule_path_display}}</span>
+  <div class="btn-row">
+    <button class="btn" data-event-click="do_browse_rate_csv">Browse CSV</button>
+    <button class="btn" data-event-click="do_load_rate_csv">Load CSV</button>
+  </div>
+  <span class="text-muted">{{rate_schedule_status}}</span>
+
   <div class="separator"></div>
 
   <!-- Video Output (collapsible) -->

@@ -304,6 +304,36 @@ def _browse_json_file(title: str, default_path: str) -> str | None:
     return None
 
 
+
+
+def _browse_csv_file(title: str, default_path: str) -> str | None:
+    """Open a file picker filtered to .csv files via PowerShell OpenFileDialog."""
+    try:
+        if sys.platform == "win32":
+            initial_dir = default_path if os.path.isdir(default_path) else os.path.expanduser("~")
+            initial_dir = initial_dir.replace(chr(92), chr(92) + chr(92))
+            ps_script = f"""
+                Add-Type -AssemblyName System.Windows.Forms
+                $dialog = New-Object System.Windows.Forms.OpenFileDialog
+                $dialog.Title = "{title}"
+                $dialog.InitialDirectory = "{initial_dir}"
+                $dialog.Filter = "Rate CSV (*.csv)|*.csv|All Files (*.*)|*.*"
+                $dialog.FilterIndex = 1
+                if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{
+                    Write-Output $dialog.FileName
+                }}
+            """
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_script],
+                capture_output=True, text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            path = result.stdout.strip()
+            return path if path else None
+    except Exception as exc:
+        lf.log.error(f"Training Render: CSV file dialog error – {exc}")
+    return None
+
 # ── Panel ─────────────────────────────────────────────────────────────────────
 
 class TrainingRenderPanel(lf.ui.Panel):
@@ -357,6 +387,13 @@ class TrainingRenderPanel(lf.ui.Panel):
         self._last_track3_path    = ""
         self._last_active_track   = "none"
 
+        # ── Rate schedule state ───────────────────────────────────────────
+        self._rate_mode             = "fixed"
+        self._rate_schedule         = []
+        self._rate_schedule_path    = ""
+        self._rate_schedule_status  = ""
+        self._pending_rate_csv_path = None
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def on_bind_model(self, ctx):
@@ -372,6 +409,16 @@ class TrainingRenderPanel(lf.ui.Panel):
         model.bind("max_iters_str",
                    lambda: str(State.max_iters),
                    lambda v: self._set_int_state("max_iters", v, 0, 1_000_000))
+
+        # Rate schedule
+        model.bind("rate_mode",
+                   lambda: self._rate_mode,
+                   self._set_rate_mode)
+        model.bind_func("rate_schedule_path_display", self._rate_schedule_path_display)
+        model.bind_func("rate_schedule_status",       self._rate_schedule_status_text)
+        model.bind_event("do_browse_rate_csv",        self._on_do_browse_rate_csv)
+        model.bind_event("do_load_rate_csv",          self._on_do_load_rate_csv)
+
 
         # Resolution
         model.bind("resolution_idx",
@@ -435,7 +482,7 @@ class TrainingRenderPanel(lf.ui.Panel):
         model.bind_func("track3_arrow", lambda: "\u25bc" if self._track3_expanded else "\u25b6")
         model.bind_func("track3_path_display",  self._track3_path_display)
         model.bind("secs_per_snap_str",
-                   lambda: f"{State.secs_per_snap:.2f}",
+                   lambda: f"{State.secs_per_snap:.3f}",
                    lambda v: self._set_float_state("secs_per_snap", v, 0.01, 300.0))
         model.bind("track3_loop",
                    lambda: State.track3_loop,
@@ -587,6 +634,13 @@ class TrainingRenderPanel(lf.ui.Panel):
             self._pending_track3_path = None
             self._dirty("track3_path_display")
             dirty = True
+
+        if self._pending_rate_csv_path is not None:
+            self._rate_schedule_path    = self._pending_rate_csv_path
+            self._pending_rate_csv_path = None
+            self._dirty("rate_schedule_path_display")
+            dirty = True
+
 
         if State.track2_loaded != self._last_track2_loaded:
             self._last_track2_loaded = State.track2_loaded
@@ -802,6 +856,7 @@ class TrainingRenderPanel(lf.ui.Panel):
             State.track3_loaded  = True
             lf.log.info(f"Training Render: LFS path loaded – {State._track3_player.info(State.secs_per_snap)}")
             self._dirty("track3_status_text", "track3_status_class", "track3_path_display")
+            self._auto_secs_per_snap()
         except Exception as exc:
             State._track3_player = None
             State.track3_loaded  = False
@@ -818,6 +873,112 @@ class TrainingRenderPanel(lf.ui.Panel):
         _stop_path_preview()
         self._dirty("preview_idle", "preview_active_state", "preview_progress_text")
 
+    def _set_rate_mode(self, value):
+        self._rate_mode = str(value)
+        State.rate_mode     = self._rate_mode
+        State.rate_schedule = self._rate_schedule
+        self._dirty("rate_mode")
+
+    def _rate_schedule_path_display(self) -> str:
+        if self._rate_schedule_path:
+            return Path(self._rate_schedule_path).name
+        return "No rate CSV selected"
+
+    def _rate_schedule_status_text(self) -> str:
+        return self._rate_schedule_status
+
+    def _on_do_browse_rate_csv(self, handle, event, args):
+        initial = str(Path(self._rate_schedule_path).parent) if self._rate_schedule_path else os.path.expanduser("~")
+        def _browse():
+            picked = _browse_csv_file("Select rate schedule CSV", initial)
+            if picked:
+                self._pending_rate_csv_path = picked
+        threading.Thread(target=_browse, daemon=True).start()
+
+    def _on_do_load_rate_csv(self, handle, event, args):
+        if self._pending_rate_csv_path is not None:
+            self._rate_schedule_path    = self._pending_rate_csv_path
+            self._pending_rate_csv_path = None
+            self._dirty("rate_schedule_path_display")
+
+        if not self._rate_schedule_path:
+            self._rate_schedule_status = "No file selected."
+            self._dirty("rate_schedule_status")
+            return
+
+        try:
+            schedule = []
+            with open(self._rate_schedule_path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = line.split(",")
+                    if len(parts) < 2:
+                        continue
+                    start_kiter = float(parts[0].strip())
+                    val         = parts[1].strip().upper()
+                    if val == "STOP":
+                        render_every = "STOP"
+                    else:
+                        render_every = int(float(val))
+                    schedule.append((int(start_kiter * 1000), render_every))
+            schedule.sort(key=lambda x: x[0])
+            self._rate_schedule        = schedule
+            State.rate_schedule        = schedule
+            State.rate_mode            = self._rate_mode
+            rows = "  |  ".join(
+                f"{s//1000}k\u2192{'STOP' if n == 'STOP' else f'every {n}'}"
+                for s, n in schedule
+            )
+
+            # Calculate total expected frame captures by enumerating per segment
+            total_frames = 0
+            for i, (start_iter, every) in enumerate(schedule):
+                if every == "STOP":
+                    break
+                next_start = schedule[i + 1][0] if i + 1 < len(schedule) else start_iter
+                if next_start <= start_iter:
+                    continue
+                total_frames += len([x for x in range(max(1, start_iter), next_start)
+                                     if x % every == 0 or x == 1])
+
+            self._rate_schedule_status = f"\u2713 {len(schedule)} row(s): {rows}  |  Total frames: {total_frames}"
+            lf.log.info(f"Training Render: rate schedule loaded – {self._rate_schedule_status}")
+        except Exception as exc:
+            self._rate_schedule        = []
+            self._rate_schedule_status = f"\u2717 Load error: {exc}"
+            lf.log.error(f"Training Render: rate CSV load error – {exc}")
+        self._dirty("rate_schedule_status")
+
+    def _auto_secs_per_snap(self):
+        """If schedule mode is active and a path is loaded, estimate secs_per_snap
+        from total_duration / total_frames."""
+        if self._rate_mode != "schedule" or not self._rate_schedule:
+            return
+        if not State.track3_loaded or State._track3_player is None:
+            return
+        # Count total frames from schedule
+        schedule = self._rate_schedule
+        total_frames = 0
+        for i, (start_iter, every) in enumerate(schedule):
+            if every == "STOP":
+                break
+            next_start = schedule[i + 1][0] if i + 1 < len(schedule) else start_iter
+            if next_start <= start_iter:
+                continue
+            total_frames += len([x for x in range(max(1, start_iter), next_start)
+                                 if x % every == 0 or x == 1])
+        if total_frames <= 0:
+            return
+        dur = State._track3_player.total_duration
+        secs = round(dur / total_frames, 3)
+        secs = max(0.001, secs)
+        State.secs_per_snap = secs
+        self._dirty("secs_per_snap_str")
+        lf.log.info(f"Training Render: auto secs_per_snap = {secs:.3f}s "
+                    f"({dur:.2f}s / {total_frames} frames)")
+
     def _on_num_step(self, handle, event, args):
         if not args or len(args) < 2:
             return
@@ -827,7 +988,7 @@ class TrainingRenderPanel(lf.ui.Panel):
         int_steps  = {"render_every": 1, "max_iters": 100, "video_fps": 1}
         int_ranges = {"render_every": (1, 100_000), "max_iters": (0, 1_000_000), "video_fps": (1, 120)}
         # float fields
-        flt_steps  = {"arc_per_snap": 1.0, "dist_per_snap": 0.01, "secs_per_snap": 0.1}
+        flt_steps  = {"arc_per_snap": 1.0, "dist_per_snap": 0.01, "secs_per_snap": 0.001}
         flt_ranges = {"arc_per_snap": (0.0, 360.0), "dist_per_snap": (0.001, 100.0), "secs_per_snap": (0.01, 300.0)}
 
         if field in int_steps:
